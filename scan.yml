@@ -1,0 +1,50 @@
+name: Bybit Pump Scanner
+
+on:
+  workflow_dispatch:   # запускается вручную через API-запрос от cron-job.org
+
+permissions:
+  contents: write
+
+# КЛЮЧЕВОЙ МОМЕНТ: если предыдущий ран ещё не закончился (не успел закоммитить
+# state.json), а cron-job.org уже дёрнул новый запуск (например при таймфрейме
+# в 1-2 минуты) — GitHub НЕ будет их выполнять параллельно, а поставит
+# следующий в очередь. Это убирает дублирование алертов в канале.
+concurrency:
+  group: bybit-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3   # страховка от зависшего рана, который будет копить очередь
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run scanner
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WINDOW_MINUTES: "20"
+          THRESHOLD_PCT: "12"
+          COOLDOWN_MINUTES: "60"
+          TZ_OFFSET_HOURS: "3"
+        run: python main.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase
+          git add state.json
+          git diff --staged --quiet || git commit -m "update state"
+          git push
