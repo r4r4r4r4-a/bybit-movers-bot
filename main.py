@@ -10,35 +10,21 @@ import requests
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-CATEGORY = "linear"  # только USDT-перпетуальные фьючерсы Bybit — спот не смотрим,
-                      # так как движения на споте и на фьючерсах не всегда совпадают
 WINDOW_MINUTES = int(os.environ.get("WINDOW_MINUTES", "20"))  # окно поиска движения
 THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "12"))  # порог срабатывания, %
 COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "60"))
 TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
-# Опциональный прокси, чтобы обойти гео-блокировку Bybit по IP раннера
-# (Bybit блокирует US/China IP — GitHub Actions часто сидит в США).
-# Формат: полный URL прокси-эндпоинта, заканчивающийся на параметр вида "...?url="
-# Пример для теста: https://api.allorigins.win/raw?url=
-# Пример для своего Cloudflare Worker: https://<имя>.workers.dev/?url=
-# Если не задано (пусто) — запросы идут напрямую, как раньше.
-PROXY_PREFIX = os.environ.get("BYBIT_PROXY", "").strip()
+
+# Опциональный прокси — на случай если MEXC когда-нибудь тоже начнёт резать
+# по IP (пока по опыту Replit-бота такого не наблюдалось, так что по
+# умолчанию не используется). Формат такой же, как раньше: полный URL
+# прокси, заканчивающийся на "...?url=".
+PROXY_PREFIX = os.environ.get("MEXC_PROXY", "").strip()
 
 STATE_FILE = "state.json"
-# mainnet + зеркало + региональные домены Bybit (публичные тикеры отдают одинаковые
-# данные независимо от региона, так что это просто больше шансов пробиться)
-BASE_URLS = [
-    "https://api.bybit.com",
-    "https://api.bytick.com",
-    "https://api.bybit.nl",
-    "https://api.bybit.tr",
-    "https://api.bybit.kz",
-    "https://api.bybitgeorgia.ge",
-    "https://api.bybit.ae",
-    "https://api.bybit.id",
-]
-RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
-RETRY_DELAY_SEC = float(os.environ.get("RETRY_DELAY_SEC", "4"))
+BASE_URLS = ["https://contract.mexc.com", "https://api.mexc.com"]
+RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "2"))
+RETRY_DELAY_SEC = float(os.environ.get("RETRY_DELAY_SEC", "3"))
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -46,39 +32,6 @@ HEADERS = {
     ),
     "Accept": "application/json",
 }
-
-
-def get_with_fallback(path, params):
-    """Пробует запрос по очереди на всех известных доменах Bybit,
-    при заданном PROXY_PREFIX — через прокси. Каждый полный круг по доменам
-    повторяется несколько раз с паузой — Cloudflare Anycast может каждый раз
-    выходить на Bybit с другого edge-сервера, так что повтор часто помогает
-    обойти точечную блокировку конкретного датацентра."""
-    last_err = None
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        for base in BASE_URLS:
-            target = f"{base}{path}"
-            if params:
-                target += "?" + urllib.parse.urlencode(params)
-            try:
-                if PROXY_PREFIX:
-                    url = PROXY_PREFIX + urllib.parse.quote(target, safe="")
-                    resp = requests.get(url, headers=HEADERS, timeout=25)
-                else:
-                    resp = requests.get(target, headers=HEADERS, timeout=15)
-                resp.raise_for_status()
-                return resp.json()
-            except requests.exceptions.HTTPError as e:
-                last_err = e
-                print(f"[warn] попытка {attempt}/{RETRY_ATTEMPTS}: {target} -> {e}")
-                continue
-            except requests.exceptions.RequestException as e:
-                last_err = e
-                print(f"[warn] попытка {attempt}/{RETRY_ATTEMPTS}: {target} -> {e}")
-                continue
-        if attempt < RETRY_ATTEMPTS:
-            time.sleep(RETRY_DELAY_SEC)
-    raise last_err
 
 
 def load_state():
@@ -93,31 +46,60 @@ def save_state(state):
         json.dump(state, f)
 
 
-def fetch_tickers(category):
-    data = get_with_fallback("/v5/market/tickers", {"category": category})
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit API error (tickers): {data}")
-    return {t["symbol"]: t for t in data["result"]["list"]}
+def get_with_fallback(path, params=None):
+    """Пробует запрос по очереди на всех известных доменах MEXC,
+    при заданном PROXY_PREFIX — через прокси. Несколько попыток с паузой
+    на случай точечных сетевых сбоев."""
+    last_err = None
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        for base in BASE_URLS:
+            target = f"{base}{path}"
+            if params:
+                target += "?" + urllib.parse.urlencode(params)
+            try:
+                if PROXY_PREFIX:
+                    url = PROXY_PREFIX + urllib.parse.quote(target, safe="")
+                    resp = requests.get(url, headers=HEADERS, timeout=25)
+                else:
+                    resp = requests.get(target, headers=HEADERS, timeout=15)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                print(f"[warn] попытка {attempt}/{RETRY_ATTEMPTS}: {target} -> {e}")
+                continue
+        if attempt < RETRY_ATTEMPTS:
+            time.sleep(RETRY_DELAY_SEC)
+    raise last_err
 
 
-def fetch_kline_window(symbol, category, minutes):
-    """1-минутные свечи за последние `minutes` минут — для точных MAX/MIN и объёма."""
+def fetch_tickers():
+    """Все тикеры фьючерсов MEXC одним запросом."""
+    data = get_with_fallback("/api/v1/contract/ticker")
+    if not data.get("success"):
+        raise RuntimeError(f"MEXC API error (tickers): {data}")
+    return {t["symbol"]: t for t in data["data"]}
+
+
+def fetch_kline_window(symbol, minutes):
+    """1-минутные свечи за последние `minutes` минут — для точных MAX/MIN."""
+    now = int(time.time())
+    start = now - (minutes + 2) * 60
     try:
         data = get_with_fallback(
-            "/v5/market/kline",
-            {
-                "category": category,
-                "symbol": symbol,
-                "interval": "1",
-                "limit": min(minutes + 2, 200),
-            },
+            f"/api/v1/contract/kline/{symbol}",
+            {"interval": "Min1", "start": start, "end": now},
         )
-    except requests.exceptions.HTTPError:
+    except requests.exceptions.RequestException:
         return None
-    if data.get("retCode") != 0:
+    if not data.get("success"):
         return None
-    # каждая свеча: [start, open, high, low, close, volume, turnover]
-    return data["result"]["list"]
+    d = data.get("data") or {}
+    highs = d.get("high") or []
+    lows = d.get("low") or []
+    if not highs or not lows:
+        return None
+    return {"high": highs, "low": lows}
 
 
 def send_telegram(text: str):
@@ -150,14 +132,15 @@ def fmt_elapsed(minutes: float) -> str:
 
 
 def build_message(symbol, direction_up, change_pct, window_min, window_max,
-                   last_price, mark_price, volume24h, elapsed_min):
+                   last_price, fair_price, volume24h, elapsed_min):
     arrow = "🟢" if direction_up else "🔴"
     sign = "+" if change_pct > 0 else ""
     now = datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)
+    display_name = symbol.replace("_USDT", "")
 
     lines = [
-        f"splash {THRESHOLD_PCT:.0f}% BYBIT",
-        f"{arrow} ${symbol.replace('USDT', '')}",
+        f"splash {THRESHOLD_PCT:.0f}% MEXC",
+        f"{arrow} ${display_name}",
         f"Изм.: <b>{sign}{change_pct:.2f}%</b> за {fmt_elapsed(elapsed_min)}",
         "",
         f"MAX: {fmt_price(window_max)}",
@@ -165,14 +148,14 @@ def build_message(symbol, direction_up, change_pct, window_min, window_max,
         "",
         f"Now last price: ${fmt_price(last_price)}",
     ]
-    if mark_price is not None:
-        lines.append(f"Справедл. price: ${fmt_price(mark_price)}")
+    if fair_price is not None:
+        lines.append(f"Справедл. price: ${fmt_price(fair_price)}")
     lines += [
         "",
         f"🌊 Volume 24h: {fmt_usd(volume24h)}",
         f"🕐 {now.strftime('%H:%M:%S')} UTC+{TZ_OFFSET_HOURS}",
         "",
-        f"🔗 https://www.bybit.com/trade/usdt/{symbol}",
+        f"🔗 https://www.mexc.com/futures/{symbol}",
     ]
     return "\n".join(lines)
 
@@ -184,22 +167,17 @@ def main():
     alerted = state.setdefault("alerted", {})
 
     try:
-        tickers = fetch_tickers(CATEGORY)
-    except requests.exceptions.HTTPError as e:
-        if "403" in str(e):
-            print(
-                "Bybit вернул 403 на всех доменах (api.bybit.com, api.bytick.com). "
-                "Это похоже на гео-блокировку IP раннера GitHub Actions "
-                "(Bybit блокирует US/China IP). Попробуй перезапустить ран — "
-                "раннеры поднимаются на разных серверах, может повезти со следующим."
-            )
+        tickers = fetch_tickers()
+    except requests.exceptions.RequestException as e:
+        print(f"Не удалось получить тикеры MEXC: {e}")
         raise
 
     window_cutoff = now - WINDOW_MINUTES * 60
     prune_cutoff = now - (WINDOW_MINUTES + 5) * 60
 
     for symbol, t in tickers.items():
-        if not symbol.endswith("USDT"):
+        # Фильтр: только USDT-маржинальные бессрочные фьючерсы с реальной ценой
+        if not symbol.endswith("_USDT"):
             continue
         try:
             last_price = float(t["lastPrice"])
@@ -221,8 +199,6 @@ def main():
         if baseline_price <= 0:
             continue
 
-        # ищем максимальное отклонение от базовой цены внутри окна,
-        # а не только "было -> стало", чтобы не пропустить откатившийся пик
         window_prices = [pt["p"] for pt in window_points]
         w_max = max(window_prices)
         w_min = min(window_prices)
@@ -241,22 +217,20 @@ def main():
         if now - last_alert_ts < COOLDOWN_MINUTES * 60:
             continue
 
-        # уточняем MAX/MIN и объём по 1-минутным свечам (точнее, чем наши снапшоты раз в 2 мин)
-        kl = fetch_kline_window(symbol, CATEGORY, WINDOW_MINUTES)
+        # уточняем MAX/MIN по 1-минутным свечам MEXC
+        kl = fetch_kline_window(symbol, WINDOW_MINUTES)
         if kl:
-            highs = [float(c[2]) for c in kl]
-            lows = [float(c[3]) for c in kl]
-            w_max = max(w_max, max(highs))
-            w_min = min(w_min, min(lows))
+            w_max = max(w_max, max(kl["high"]))
+            w_min = min(w_min, min(kl["low"]))
 
-        mark_price = None
+        fair_price = None
         try:
-            mark_price = float(t.get("markPrice")) if t.get("markPrice") else None
+            fair_price = float(t.get("fairPrice")) if t.get("fairPrice") else None
         except (ValueError, TypeError):
-            mark_price = None
+            fair_price = None
 
         try:
-            volume24h_usd = float(t.get("turnover24h", 0))
+            volume24h_usd = float(t.get("amount24", 0))
         except (ValueError, TypeError):
             volume24h_usd = 0.0
 
@@ -264,7 +238,7 @@ def main():
 
         text = build_message(
             symbol, direction_up, change_pct, w_min, w_max,
-            last_price, mark_price, volume24h_usd, elapsed_min,
+            last_price, fair_price, volume24h_usd, elapsed_min,
         )
         send_telegram(text)
         alerted[symbol] = now
