@@ -30,6 +30,12 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
+      - name: Test telegram
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
+            -d text="Тест: GitHub Actions может достучаться до Telegram"
+
       - name: Run scanner
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
