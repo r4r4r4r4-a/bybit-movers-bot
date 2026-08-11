@@ -144,8 +144,7 @@ def build_message(symbol, direction_up, change_pct, window_min, window_max,
     display_name = symbol.replace("_USDT", "")
 
     lines = [
-        f"splash {THRESHOLD_PCT:.0f}% MEXC",
-        f"{arrow} ${display_name}",
+        f"{arrow} #{display_name}",
         f"Изм.: <b>{sign}{change_pct:.2f}%</b> за {fmt_elapsed(elapsed_min)}",
         "",
         f"MAX: {fmt_price(window_max)}",
