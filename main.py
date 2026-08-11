@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -14,13 +15,18 @@ CATEGORY = "linear"  # только USDT-перпетуальные фьючер
 WINDOW_MINUTES = int(os.environ.get("WINDOW_MINUTES", "20"))  # окно поиска движения
 THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "12"))  # порог срабатывания, %
 COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "60"))
-TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))  # для отображения времени, как на скрине (UTC+3)
+TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
+# Опциональный прокси, чтобы обойти гео-блокировку Bybit по IP раннера
+# (Bybit блокирует US/China IP — GitHub Actions часто сидит в США).
+# Формат: полный URL прокси-эндпоинта, заканчивающийся на параметр вида "...?url="
+# Пример для теста: https://api.allorigins.win/raw?url=
+# Пример для своего Cloudflare Worker: https://<имя>.workers.dev/?url=
+# Если не задано (пусто) — запросы идут напрямую, как раньше.
+PROXY_PREFIX = os.environ.get("BYBIT_PROXY", "").strip()
 
 STATE_FILE = "state.json"
 BASE_URLS = ["https://api.bybit.com", "https://api.bytick.com"]  # mainnet + зеркало
 HEADERS = {
-    # некоторые CDN блокируют запросы без "браузерного" User-Agent —
-    # это не обход гео-бана, но дешёвая попытка на случай если 403 не только про IP
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -30,17 +36,24 @@ HEADERS = {
 
 
 def get_with_fallback(path, params):
-    """Пробует запрос по очереди на всех известных доменах Bybit.
-    Если IP раннера попал под блокировку (403 для US/CN IP), пробуем зеркало."""
+    """Пробует запрос по очереди на всех известных доменах Bybit,
+    при заданном PROXY_PREFIX — через прокси (обход гео-блокировки IP)."""
     last_err = None
     for base in BASE_URLS:
+        target = f"{base}{path}"
+        if params:
+            target += "?" + urllib.parse.urlencode(params)
         try:
-            resp = requests.get(f"{base}{path}", params=params, headers=HEADERS, timeout=15)
+            if PROXY_PREFIX:
+                url = PROXY_PREFIX + urllib.parse.quote(target, safe="")
+                resp = requests.get(url, headers=HEADERS, timeout=25)
+            else:
+                resp = requests.get(target, headers=HEADERS, timeout=15)
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.HTTPError as e:
             last_err = e
-            print(f"[warn] {base}{path} -> {e}")
+            print(f"[warn] {target} -> {e}")
             continue
     raise last_err
 
