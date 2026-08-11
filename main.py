@@ -25,6 +25,15 @@ TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
 # прокси, заканчивающийся на "...?url=".
 PROXY_PREFIX = os.environ.get("MEXC_PROXY", "").strip()
 
+# --- Фильтр "только монеты, которые есть на фьючерсах Bybit" ---
+# Bybit блокирует частый опрос по IP, но список инструментов не нужно
+# спрашивать каждые 1-2 минуты — обновляем редко (раз в N часов) через тот
+# же Cloudflare Worker-прокси, что был поднят раньше для обхода блока.
+ENABLE_BYBIT_FILTER = os.environ.get("ENABLE_BYBIT_FILTER", "true").strip().lower() != "false"
+BYBIT_PROXY_PREFIX = os.environ.get("BYBIT_PROXY", "").strip()
+BYBIT_SYMBOLS_REFRESH_HOURS = float(os.environ.get("BYBIT_SYMBOLS_REFRESH_HOURS", "12"))
+BYBIT_BASE_URLS = ["https://api.bybit.com", "https://api.bytick.com"]
+
 STATE_FILE = "state.json"
 BASE_URLS = ["https://contract.mexc.com", "https://api.mexc.com"]
 RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "2"))
