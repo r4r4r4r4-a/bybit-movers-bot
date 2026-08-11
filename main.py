@@ -8,7 +8,11 @@ import requests
 
 # ---------- НАСТРОЙКИ (через переменные окружения / GitHub Secrets) ----------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+# Можно указать несколько адресов через запятую: "123456,-1001234567890"
+# (например личный chat_id и id канала одновременно) — бот пошлёт в каждый.
+TELEGRAM_CHAT_IDS = [
+    c.strip() for c in os.environ["TELEGRAM_CHAT_ID"].split(",") if c.strip()
+]
 
 WINDOW_MINUTES = int(os.environ.get("WINDOW_MINUTES", "20"))  # окно поиска движения
 THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "12"))  # порог срабатывания, %
@@ -104,15 +108,16 @@ def fetch_kline_window(symbol, minutes):
 
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    r = requests.post(url, data=payload, timeout=15)
-    if not r.ok:
-        print("Telegram send error:", r.text)
+    for chat_id in TELEGRAM_CHAT_IDS:
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        r = requests.post(url, data=payload, timeout=15)
+        if not r.ok:
+            print(f"Telegram send error (chat_id={chat_id}):", r.text)
 
 
 def fmt_price(p: float) -> str:
