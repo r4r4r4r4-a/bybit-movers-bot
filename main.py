@@ -25,7 +25,20 @@ TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
 PROXY_PREFIX = os.environ.get("BYBIT_PROXY", "").strip()
 
 STATE_FILE = "state.json"
-BASE_URLS = ["https://api.bybit.com", "https://api.bytick.com"]  # mainnet + зеркало
+# mainnet + зеркало + региональные домены Bybit (публичные тикеры отдают одинаковые
+# данные независимо от региона, так что это просто больше шансов пробиться)
+BASE_URLS = [
+    "https://api.bybit.com",
+    "https://api.bytick.com",
+    "https://api.bybit.nl",
+    "https://api.bybit.tr",
+    "https://api.bybit.kz",
+    "https://api.bybitgeorgia.ge",
+    "https://api.bybit.ae",
+    "https://api.bybit.id",
+]
+RETRY_ATTEMPTS = int(os.environ.get("RETRY_ATTEMPTS", "3"))
+RETRY_DELAY_SEC = float(os.environ.get("RETRY_DELAY_SEC", "4"))
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -37,24 +50,34 @@ HEADERS = {
 
 def get_with_fallback(path, params):
     """Пробует запрос по очереди на всех известных доменах Bybit,
-    при заданном PROXY_PREFIX — через прокси (обход гео-блокировки IP)."""
+    при заданном PROXY_PREFIX — через прокси. Каждый полный круг по доменам
+    повторяется несколько раз с паузой — Cloudflare Anycast может каждый раз
+    выходить на Bybit с другого edge-сервера, так что повтор часто помогает
+    обойти точечную блокировку конкретного датацентра."""
     last_err = None
-    for base in BASE_URLS:
-        target = f"{base}{path}"
-        if params:
-            target += "?" + urllib.parse.urlencode(params)
-        try:
-            if PROXY_PREFIX:
-                url = PROXY_PREFIX + urllib.parse.quote(target, safe="")
-                resp = requests.get(url, headers=HEADERS, timeout=25)
-            else:
-                resp = requests.get(target, headers=HEADERS, timeout=15)
-            resp.raise_for_status()
-            return resp.json()
-        except requests.exceptions.HTTPError as e:
-            last_err = e
-            print(f"[warn] {target} -> {e}")
-            continue
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        for base in BASE_URLS:
+            target = f"{base}{path}"
+            if params:
+                target += "?" + urllib.parse.urlencode(params)
+            try:
+                if PROXY_PREFIX:
+                    url = PROXY_PREFIX + urllib.parse.quote(target, safe="")
+                    resp = requests.get(url, headers=HEADERS, timeout=25)
+                else:
+                    resp = requests.get(target, headers=HEADERS, timeout=15)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.HTTPError as e:
+                last_err = e
+                print(f"[warn] попытка {attempt}/{RETRY_ATTEMPTS}: {target} -> {e}")
+                continue
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                print(f"[warn] попытка {attempt}/{RETRY_ATTEMPTS}: {target} -> {e}")
+                continue
+        if attempt < RETRY_ATTEMPTS:
+            time.sleep(RETRY_DELAY_SEC)
     raise last_err
 
 
