@@ -17,7 +17,32 @@ COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "60"))
 TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))  # для отображения времени, как на скрине (UTC+3)
 
 STATE_FILE = "state.json"
-BASE_URL = "https://api.bybit.com"
+BASE_URLS = ["https://api.bybit.com", "https://api.bytick.com"]  # mainnet + зеркало
+HEADERS = {
+    # некоторые CDN блокируют запросы без "браузерного" User-Agent —
+    # это не обход гео-бана, но дешёвая попытка на случай если 403 не только про IP
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
+
+def get_with_fallback(path, params):
+    """Пробует запрос по очереди на всех известных доменах Bybit.
+    Если IP раннера попал под блокировку (403 для US/CN IP), пробуем зеркало."""
+    last_err = None
+    for base in BASE_URLS:
+        try:
+            resp = requests.get(f"{base}{path}", params=params, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            last_err = e
+            print(f"[warn] {base}{path} -> {e}")
+            continue
+    raise last_err
 
 
 def load_state():
@@ -33,11 +58,7 @@ def save_state(state):
 
 
 def fetch_tickers(category):
-    resp = requests.get(
-        f"{BASE_URL}/v5/market/tickers", params={"category": category}, timeout=15
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    data = get_with_fallback("/v5/market/tickers", {"category": category})
     if data.get("retCode") != 0:
         raise RuntimeError(f"Bybit API error (tickers): {data}")
     return {t["symbol"]: t for t in data["result"]["list"]}
@@ -45,18 +66,18 @@ def fetch_tickers(category):
 
 def fetch_kline_window(symbol, category, minutes):
     """1-минутные свечи за последние `minutes` минут — для точных MAX/MIN и объёма."""
-    resp = requests.get(
-        f"{BASE_URL}/v5/market/kline",
-        params={
-            "category": category,
-            "symbol": symbol,
-            "interval": "1",
-            "limit": min(minutes + 2, 200),
-        },
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        data = get_with_fallback(
+            "/v5/market/kline",
+            {
+                "category": category,
+                "symbol": symbol,
+                "interval": "1",
+                "limit": min(minutes + 2, 200),
+            },
+        )
+    except requests.exceptions.HTTPError:
+        return None
     if data.get("retCode") != 0:
         return None
     # каждая свеча: [start, open, high, low, close, volume, turnover]
@@ -126,7 +147,17 @@ def main():
     history = state.setdefault("history", {})
     alerted = state.setdefault("alerted", {})
 
-    tickers = fetch_tickers(CATEGORY)
+    try:
+        tickers = fetch_tickers(CATEGORY)
+    except requests.exceptions.HTTPError as e:
+        if "403" in str(e):
+            print(
+                "Bybit вернул 403 на всех доменах (api.bybit.com, api.bytick.com). "
+                "Это похоже на гео-блокировку IP раннера GitHub Actions "
+                "(Bybit блокирует US/China IP). Попробуй перезапустить ран — "
+                "раннеры поднимаются на разных серверах, может повезти со следующим."
+            )
+        raise
 
     window_cutoff = now - WINDOW_MINUTES * 60
     prune_cutoff = now - (WINDOW_MINUTES + 5) * 60
