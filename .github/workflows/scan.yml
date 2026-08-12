@@ -34,6 +34,8 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BYBIT_PROXY: ${{ secrets.BYBIT_PROXY }}
+          ENABLE_BYBIT_FILTER: "true"
           WINDOW_MINUTES: "20"
           THRESHOLD_PCT: "12"
           COOLDOWN_MINUTES: "60"
