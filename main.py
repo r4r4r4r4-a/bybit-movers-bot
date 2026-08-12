@@ -115,6 +115,68 @@ def fetch_kline_window(symbol, minutes):
     return {"high": highs, "low": lows}
 
 
+def fetch_bybit_symbols():
+    """Полный список торгующихся линейных USDT-перпетуалов Bybit — через
+    Cloudflare Worker-прокси (BYBIT_PROXY). Не для частого опроса,
+    вызывается редко (раз в BYBIT_SYMBOLS_REFRESH_HOURS часов)."""
+    if not BYBIT_PROXY_PREFIX:
+        return None
+    symbols = set()
+    cursor = ""
+    for attempt in range(1, 3):
+        try:
+            symbols = set()
+            cursor = ""
+            for _ in range(10):  # защита от бесконечной пагинации
+                params = {"category": "linear", "status": "Trading", "limit": "1000"}
+                if cursor:
+                    params["cursor"] = cursor
+                target = (
+                    BYBIT_BASE_URLS[0]
+                    + "/v5/market/instruments-info?"
+                    + urllib.parse.urlencode(params)
+                )
+                url = BYBIT_PROXY_PREFIX + urllib.parse.quote(target, safe="")
+                resp = requests.get(url, headers=HEADERS, timeout=25)
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("retCode") != 0:
+                    raise RuntimeError(str(data))
+                for item in data["result"]["list"]:
+                    symbols.add(item["symbol"])
+                cursor = data["result"].get("nextPageCursor") or ""
+                if not cursor:
+                    break
+            return symbols
+        except Exception as e:
+            print(f"[warn] fetch_bybit_symbols попытка {attempt}/2: {e}")
+            time.sleep(2)
+    return None
+
+
+def get_bybit_symbol_set(state, now):
+    """Кэшированный список символов Bybit — обновляется редко, при неудаче
+    остаётся на прошлом закэшированном значении (fail-soft)."""
+    if not ENABLE_BYBIT_FILTER:
+        return None
+    entry = state.get("bybit_symbols")
+    stale = (
+        not entry
+        or now - entry.get("updated_at", 0) > BYBIT_SYMBOLS_REFRESH_HOURS * 3600
+    )
+    if stale:
+        fetched = fetch_bybit_symbols()
+        if fetched:
+            state["bybit_symbols"] = {"list": sorted(fetched), "updated_at": now}
+            entry = state["bybit_symbols"]
+        elif not entry:
+            print("[warn] список Bybit ещё ни разу не получен — фильтр временно выключен")
+            return None
+        else:
+            print("[warn] не удалось обновить список Bybit — использую старый кэш")
+    return set(entry["list"])
+
+
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for chat_id in TELEGRAM_CHAT_IDS:
@@ -153,7 +215,7 @@ def build_message(symbol, direction_up, change_pct, window_min, window_max,
     display_name = symbol.replace("_USDT", "")
 
     lines = [
-        f"{arrow} <code>${display_name}</code>",
+        f"{arrow} $<code>{display_name}</code>",
         f"Изм.: <b>{sign}{change_pct:.2f}%</b> за {fmt_elapsed(elapsed_min)}",
         "",
         f"MAX: {fmt_price(window_max)}",
@@ -167,8 +229,6 @@ def build_message(symbol, direction_up, change_pct, window_min, window_max,
         "",
         f"🌊 Volume 24h: {fmt_usd(volume24h)}",
         f"🕐 {now.strftime('%H:%M:%S')} UTC+{TZ_OFFSET_HOURS}",
-        "",
-        f"🔗 https://www.mexc.com/futures/{symbol}",
     ]
     return "\n".join(lines)
 
@@ -188,10 +248,19 @@ def main():
     window_cutoff = now - WINDOW_MINUTES * 60
     prune_cutoff = now - (WINDOW_MINUTES + 5) * 60
 
+    bybit_symbol_set = get_bybit_symbol_set(state, now)
+
     for symbol, t in tickers.items():
         # Фильтр: только USDT-маржинальные бессрочные фьючерсы с реальной ценой
         if not symbol.endswith("_USDT"):
             continue
+
+        # Фильтр: монета должна быть и на фьючерсах Bybit (если список доступен)
+        if bybit_symbol_set is not None:
+            bybit_style = symbol.replace("_", "")
+            if bybit_style not in bybit_symbol_set:
+                continue
+
         try:
             last_price = float(t["lastPrice"])
         except (KeyError, ValueError, TypeError):
