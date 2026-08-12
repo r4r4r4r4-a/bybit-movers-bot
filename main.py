@@ -47,6 +47,24 @@ HEADERS = {
 }
 
 
+STATIC_BYBIT_SYMBOLS_FILE = "bybit_instruments_raw.json"
+
+
+def load_static_bybit_symbols():
+    """Резервный/основной источник списка Bybit — обычный JSON-файл в репо,
+    сохранённый вручную (браузером, где нет гео-блока), в том же формате,
+    что отдаёт сам Bybit API (result.list[].symbol)."""
+    if not os.path.exists(STATIC_BYBIT_SYMBOLS_FILE):
+        return None
+    try:
+        with open(STATIC_BYBIT_SYMBOLS_FILE, "r") as f:
+            data = json.load(f)
+        return {item["symbol"] for item in data["result"]["list"]}
+    except Exception as e:
+        print(f"[warn] не удалось прочитать {STATIC_BYBIT_SYMBOLS_FILE}: {e}")
+        return None
+
+
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
@@ -117,47 +135,51 @@ def fetch_kline_window(symbol, minutes):
 
 def fetch_bybit_symbols():
     """Полный список торгующихся линейных USDT-перпетуалов Bybit — через
-    Cloudflare Worker-прокси (BYBIT_PROXY). Вызывается редко (раз в
-    BYBIT_SYMBOLS_REFRESH_HOURS часов), поэтому можно не жалеть попыток —
-    Bybit даже через прокси иногда точечно отдаёт 403/522 на конкретный
-    edge-сервер, так что перебираем и домены, и количество попыток."""
+    Cloudflare Worker-прокси (BYBIT_PROXY). ВАЖНО: из GitHub Actions это,
+    скорее всего, ВСЕГДА будет проваливаться — Anycast-сеть Cloudflare
+    роутит запрос на ближайший к источнику дата-центр, а GitHub Actions
+    физически сидит в США, откуда Bybit банит по гео систематически (не
+    случайно). Поэтому не тратим много попыток — если не сработает, ниже по
+    цепочке всё равно есть статический файл-резерв."""
     if not BYBIT_PROXY_PREFIX:
         return None
-    for attempt in range(1, 6):
-        for base in BYBIT_BASE_URLS:
-            try:
-                symbols = set()
-                cursor = ""
-                for _ in range(10):  # защита от бесконечной пагинации
-                    params = {"category": "linear", "status": "Trading", "limit": "1000"}
-                    if cursor:
-                        params["cursor"] = cursor
-                    target = base + "/v5/market/instruments-info?" + urllib.parse.urlencode(params)
-                    url = BYBIT_PROXY_PREFIX + urllib.parse.quote(target, safe="")
-                    resp = requests.get(url, headers=HEADERS, timeout=25)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    if data.get("retCode") != 0:
-                        raise RuntimeError(str(data))
-                    for item in data["result"]["list"]:
-                        symbols.add(item["symbol"])
-                    cursor = data["result"].get("nextPageCursor") or ""
-                    if not cursor:
-                        break
-                if symbols:
-                    print(f"[info] список Bybit получен: {len(symbols)} символов ({base})")
-                    return symbols
-            except Exception as e:
-                print(f"[warn] fetch_bybit_symbols попытка {attempt}/5 ({base}): {e}")
-        time.sleep(3)
+    for base in BYBIT_BASE_URLS:
+        try:
+            symbols = set()
+            cursor = ""
+            for _ in range(10):
+                params = {"category": "linear", "status": "Trading", "limit": "1000"}
+                if cursor:
+                    params["cursor"] = cursor
+                target = base + "/v5/market/instruments-info?" + urllib.parse.urlencode(params)
+                url = BYBIT_PROXY_PREFIX + urllib.parse.quote(target, safe="")
+                resp = requests.get(url, headers=HEADERS, timeout=25)
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("retCode") != 0:
+                    raise RuntimeError(str(data))
+                for item in data["result"]["list"]:
+                    symbols.add(item["symbol"])
+                cursor = data["result"].get("nextPageCursor") or ""
+                if not cursor:
+                    break
+            if symbols:
+                print(f"[info] список Bybit получен живьём: {len(symbols)} символов ({base})")
+                return symbols
+        except Exception as e:
+            print(f"[warn] fetch_bybit_symbols ({base}): {e}")
     return None
 
 
 def get_bybit_symbol_set(state, now):
-    """Кэшированный список символов Bybit — обновляется редко. Если список
-    ещё ни разу не получен успешно — возвращаем пустое множество (фильтр
-    работает как "ничего не пропускать"), а не отключаем фильтр совсем:
-    лучше промолчать один цикл, чем прислать монету, которой нет на Bybit."""
+    """Список символов Bybit для фильтра. Порядок приоритета:
+    1) свежий кэш в state.json (обновлялся не дольше BYBIT_SYMBOLS_REFRESH_HOURS назад)
+    2) попытка обновить по сети через прокси (может не сработать — GitHub Actions
+       физически не может пробить гео-блок Bybit из-за геопривязки Anycast, это
+       системное ограничение, а не невезение — так что не рассчитываем на неё)
+    3) статический файл bybit_instruments_raw.json, сохранённый вручную из браузера
+    4) старый (просроченный) кэш в state.json, если он есть
+    5) пусто — алерты этого цикла пропускаются, лучше молчать, чем прислать не ту монету"""
     if not ENABLE_BYBIT_FILTER:
         return None
     entry = state.get("bybit_symbols")
@@ -169,12 +191,16 @@ def get_bybit_symbol_set(state, now):
         fetched = fetch_bybit_symbols()
         if fetched:
             state["bybit_symbols"] = {"list": sorted(fetched), "updated_at": now}
-            entry = state["bybit_symbols"]
-        elif not entry:
-            print("[warn] список Bybit ещё ни разу не получен — алерты этого цикла пропущены")
-            return set()
-        else:
+            return fetched
+        static_syms = load_static_bybit_symbols()
+        if static_syms:
+            print(f"[info] использую статический список Bybit: {len(static_syms)} символов")
+            return static_syms
+        if entry:
             print("[warn] не удалось обновить список Bybit — использую старый кэш")
+            return set(entry["list"])
+        print("[warn] список Bybit недоступен ни живьём, ни статически — алерты этого цикла пропущены")
+        return set()
     return set(entry["list"])
 
 
