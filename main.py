@@ -117,46 +117,47 @@ def fetch_kline_window(symbol, minutes):
 
 def fetch_bybit_symbols():
     """Полный список торгующихся линейных USDT-перпетуалов Bybit — через
-    Cloudflare Worker-прокси (BYBIT_PROXY). Не для частого опроса,
-    вызывается редко (раз в BYBIT_SYMBOLS_REFRESH_HOURS часов)."""
+    Cloudflare Worker-прокси (BYBIT_PROXY). Вызывается редко (раз в
+    BYBIT_SYMBOLS_REFRESH_HOURS часов), поэтому можно не жалеть попыток —
+    Bybit даже через прокси иногда точечно отдаёт 403/522 на конкретный
+    edge-сервер, так что перебираем и домены, и количество попыток."""
     if not BYBIT_PROXY_PREFIX:
         return None
-    symbols = set()
-    cursor = ""
-    for attempt in range(1, 3):
-        try:
-            symbols = set()
-            cursor = ""
-            for _ in range(10):  # защита от бесконечной пагинации
-                params = {"category": "linear", "status": "Trading", "limit": "1000"}
-                if cursor:
-                    params["cursor"] = cursor
-                target = (
-                    BYBIT_BASE_URLS[0]
-                    + "/v5/market/instruments-info?"
-                    + urllib.parse.urlencode(params)
-                )
-                url = BYBIT_PROXY_PREFIX + urllib.parse.quote(target, safe="")
-                resp = requests.get(url, headers=HEADERS, timeout=25)
-                resp.raise_for_status()
-                data = resp.json()
-                if data.get("retCode") != 0:
-                    raise RuntimeError(str(data))
-                for item in data["result"]["list"]:
-                    symbols.add(item["symbol"])
-                cursor = data["result"].get("nextPageCursor") or ""
-                if not cursor:
-                    break
-            return symbols
-        except Exception as e:
-            print(f"[warn] fetch_bybit_symbols попытка {attempt}/2: {e}")
-            time.sleep(2)
+    for attempt in range(1, 6):
+        for base in BYBIT_BASE_URLS:
+            try:
+                symbols = set()
+                cursor = ""
+                for _ in range(10):  # защита от бесконечной пагинации
+                    params = {"category": "linear", "status": "Trading", "limit": "1000"}
+                    if cursor:
+                        params["cursor"] = cursor
+                    target = base + "/v5/market/instruments-info?" + urllib.parse.urlencode(params)
+                    url = BYBIT_PROXY_PREFIX + urllib.parse.quote(target, safe="")
+                    resp = requests.get(url, headers=HEADERS, timeout=25)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if data.get("retCode") != 0:
+                        raise RuntimeError(str(data))
+                    for item in data["result"]["list"]:
+                        symbols.add(item["symbol"])
+                    cursor = data["result"].get("nextPageCursor") or ""
+                    if not cursor:
+                        break
+                if symbols:
+                    print(f"[info] список Bybit получен: {len(symbols)} символов ({base})")
+                    return symbols
+            except Exception as e:
+                print(f"[warn] fetch_bybit_symbols попытка {attempt}/5 ({base}): {e}")
+        time.sleep(3)
     return None
 
 
 def get_bybit_symbol_set(state, now):
-    """Кэшированный список символов Bybit — обновляется редко, при неудаче
-    остаётся на прошлом закэшированном значении (fail-soft)."""
+    """Кэшированный список символов Bybit — обновляется редко. Если список
+    ещё ни разу не получен успешно — возвращаем пустое множество (фильтр
+    работает как "ничего не пропускать"), а не отключаем фильтр совсем:
+    лучше промолчать один цикл, чем прислать монету, которой нет на Bybit."""
     if not ENABLE_BYBIT_FILTER:
         return None
     entry = state.get("bybit_symbols")
@@ -170,8 +171,8 @@ def get_bybit_symbol_set(state, now):
             state["bybit_symbols"] = {"list": sorted(fetched), "updated_at": now}
             entry = state["bybit_symbols"]
         elif not entry:
-            print("[warn] список Bybit ещё ни разу не получен — фильтр временно выключен")
-            return None
+            print("[warn] список Bybit ещё ни разу не получен — алерты этого цикла пропущены")
+            return set()
         else:
             print("[warn] не удалось обновить список Bybit — использую старый кэш")
     return set(entry["list"])
