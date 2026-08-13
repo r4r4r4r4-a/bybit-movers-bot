@@ -17,6 +17,10 @@ TELEGRAM_CHAT_IDS = [
 WINDOW_MINUTES = int(os.environ.get("WINDOW_MINUTES", "20"))  # окно поиска движения
 THRESHOLD_PCT = float(os.environ.get("THRESHOLD_PCT", "12"))  # порог срабатывания, %
 COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "60"))
+# Если движение в ту же сторону усилилось ещё на столько % (сверх уже
+# отправленного алерта) — шлём повторный алерт немедленно, не дожидаясь
+# окончания кулдауна. По умолчанию — половина основного порога.
+CONTINUATION_PCT = float(os.environ.get("CONTINUATION_PCT", str(THRESHOLD_PCT / 2)))
 TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
 
 # Опциональный прокси — на случай если MEXC когда-нибудь тоже начнёт резать
@@ -303,28 +307,75 @@ def main():
         if len(window_points) < 2:
             continue  # ещё не набралась история на нужное окно
 
-        baseline_price = window_points[0]["p"]
-        baseline_ts = window_points[0]["t"]
-        if baseline_price <= 0:
-            continue
+        window_prices = [(pt["t"], pt["p"]) for pt in window_points]
 
-        window_prices = [pt["p"] for pt in window_points]
-        w_max = max(window_prices)
-        w_min = min(window_prices)
+        # Ищем лучший "свинг" внутри окна — не просто (окно_старт -> окно_конец),
+        # а максимальное движение от любого локального минимума/максимума
+        # до последующей точки. Так время движения отражает, когда РЕАЛЬНО
+        # начался конкретный рывок, а не всегда "край окна" (~20 мин).
+        best_up_pct = -1e18
+        best_up_start_ts = best_up_end_ts = None
+        best_up_lo = best_up_hi = None
+        running_min_ts, running_min_p = window_prices[0]
 
-        up_pct = (w_max - baseline_price) / baseline_price * 100
-        down_pct = (baseline_price - w_min) / baseline_price * 100
+        best_down_pct = -1e18
+        best_down_start_ts = best_down_end_ts = None
+        best_down_lo = best_down_hi = None
+        running_max_ts, running_max_p = window_prices[0]
 
-        if up_pct >= THRESHOLD_PCT:
-            direction_up, change_pct = True, up_pct
-        elif down_pct >= THRESHOLD_PCT:
-            direction_up, change_pct = False, -down_pct
+        for ts, p in window_prices[1:]:
+            if running_min_p > 0:
+                up = (p - running_min_p) / running_min_p * 100
+                if up > best_up_pct:
+                    best_up_pct = up
+                    best_up_start_ts, best_up_end_ts = running_min_ts, ts
+                    best_up_lo, best_up_hi = running_min_p, p
+            if running_max_p > 0:
+                down = (running_max_p - p) / running_max_p * 100
+                if down > best_down_pct:
+                    best_down_pct = down
+                    best_down_start_ts, best_down_end_ts = running_max_ts, ts
+                    best_down_lo, best_down_hi = p, running_max_p
+            if p <= running_min_p:
+                running_min_ts, running_min_p = ts, p
+            if p >= running_max_p:
+                running_max_ts, running_max_p = ts, p
+
+        if best_up_pct >= THRESHOLD_PCT and best_up_pct >= best_down_pct:
+            direction_up = True
+            change_pct = best_up_pct
+            swing_start_ts, swing_end_ts = best_up_start_ts, best_up_end_ts
+            w_min, w_max = best_up_lo, best_up_hi
+        elif best_down_pct >= THRESHOLD_PCT:
+            direction_up = False
+            change_pct = -best_down_pct
+            swing_start_ts, swing_end_ts = best_down_start_ts, best_down_end_ts
+            w_min, w_max = best_down_lo, best_down_hi
         else:
             continue
 
-        last_alert_ts = alerted.get(symbol, 0)
-        if now - last_alert_ts < COOLDOWN_MINUTES * 60:
-            continue
+        # Кулдаун можно пробить, если движение в ту же сторону заметно
+        # усилилось с прошлого алерта (хотя бы на CONTINUATION_PCT дальше) —
+        # иначе можно пропустить, как памп ушёл с 12% до 18%+ без повторного сигнала.
+        prev = alerted.get(symbol)
+        if isinstance(prev, dict):
+            prev_ts = prev.get("ts", 0)
+            prev_pct = prev.get("change_pct", 0.0)
+        else:
+            prev_ts = prev or 0
+            prev_pct = None
+
+        in_cooldown = now - prev_ts < COOLDOWN_MINUTES * 60
+        if in_cooldown:
+            same_direction = prev_pct is not None and (
+                (direction_up and prev_pct > 0) or (not direction_up and prev_pct < 0)
+            )
+            escalated = (
+                same_direction
+                and abs(change_pct) - abs(prev_pct) >= CONTINUATION_PCT
+            )
+            if not escalated:
+                continue
 
         # уточняем MAX/MIN по 1-минутным свечам MEXC
         kl = fetch_kline_window(symbol, WINDOW_MINUTES)
@@ -343,18 +394,19 @@ def main():
         except (ValueError, TypeError):
             volume24h_usd = 0.0
 
-        elapsed_min = (now - baseline_ts) / 60
+        elapsed_min = max((swing_end_ts - swing_start_ts) / 60, 0.1)
 
         text = build_message(
             symbol, direction_up, change_pct, w_min, w_max,
             last_price, fair_price, volume24h_usd, elapsed_min,
         )
         send_telegram(text)
-        alerted[symbol] = now
+        alerted[symbol] = {"ts": now, "change_pct": change_pct}
 
     alert_cutoff = now - COOLDOWN_MINUTES * 60 * 2
     for sym in list(alerted.keys()):
-        if alerted[sym] < alert_cutoff:
+        ts = alerted[sym]["ts"] if isinstance(alerted[sym], dict) else alerted[sym]
+        if ts < alert_cutoff:
             del alerted[sym]
 
     save_state(state)
